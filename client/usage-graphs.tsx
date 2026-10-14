@@ -1,7 +1,7 @@
 import { type PluginClientContext, type PluginPopoverProps, type PluginSidebarItemProps, usePaseo } from "@getpaseo/plugin/client";
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { Pressable, Text, View } from "react-native";
+import { useEffect, useRef, useState } from "react";
+import { Animated, Easing, Pressable, Text, View } from "react-native";
 
 type Theme = PluginSidebarItemProps["theme"];
 type UsagePayload = Awaited<ReturnType<PluginClientContext["paseo"]["providers"]["listUsage"]>>;
@@ -11,6 +11,8 @@ type UsageQuery = ReturnType<typeof useUsage>;
 type AccountState = "loading" | "failed" | "missing" | "error" | "unavailable" | "no_windows" | "ok";
 
 const MINUTE = 60_000;
+const SPIN_MS = 800;
+const DONE_MS = 1800;
 const PROVIDERS = [
   { id: "claude", name: "Claude" },
   { id: "codex", name: "Codex" },
@@ -254,32 +256,96 @@ function AccountDetail({ name, provider, state, theme, now }: { name: string; pr
   return <Text style={{ fontSize: 13, color: secondaryText(theme) }}>불러오는 중…</Text>;
 }
 
+/** Manual refresh with a minimum spin, so even an instant cache hit visibly does something. */
+function useManualRefresh(query: UsageQuery) {
+  const [spinning, setSpinning] = useState(false);
+  const [done, setDone] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clear = () => { if (timer.current !== null) clearTimeout(timer.current); };
+  useEffect(() => clear, []);
+  const refresh = async () => {
+    if (spinning) return;
+    clear();
+    setDone(false);
+    setSpinning(true);
+    const [result] = await Promise.all([query.refetch(), new Promise<void>((resolve) => setTimeout(resolve, SPIN_MS))]);
+    setSpinning(false);
+    if (result.isError) return;
+    setDone(true);
+    timer.current = setTimeout(() => setDone(false), DONE_MS);
+  };
+  return { refresh, spinning, done };
+}
+
+function RefreshButton({ theme, spinning, onPress }: { theme: Theme; spinning: boolean; onPress(): void }) {
+  const turn = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (!spinning) return;
+    const loop = Animated.loop(Animated.timing(turn, { toValue: 1, duration: SPIN_MS, easing: Easing.linear, useNativeDriver: false }));
+    loop.start();
+    return () => {
+      loop.stop();
+      // Ease out to the next full turn instead of snapping back.
+      turn.stopAnimation((value) => {
+        Animated.timing(turn, { toValue: 1, duration: (1 - value) * SPIN_MS * 1.6, easing: Easing.out(Easing.cubic), useNativeDriver: false })
+          .start(() => turn.setValue(0));
+      });
+    };
+  }, [spinning, turn]);
+  const rotate = turn.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] });
+  return (
+    <Pressable accessibilityRole="button" accessibilityLabel="새로고침" accessibilityState={{ busy: spinning }} aria-busy={spinning} hitSlop={8}
+      disabled={spinning} onPress={onPress}
+      style={({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) => ({
+        width: 26, height: 26, borderRadius: 7, alignItems: "center", justifyContent: "center",
+        backgroundColor: hovered || pressed ? theme.colors.surface2 : "transparent",
+        transform: [{ scale: pressed ? 0.88 : 1 }],
+      })}>
+      <Animated.Text style={{ fontSize: 15, lineHeight: 17, color: spinning ? theme.colors.foreground : secondaryText(theme), transform: [{ rotate }] }}>↻</Animated.Text>
+    </Pressable>
+  );
+}
+
+function RefreshStatus({ theme, done, updated }: { theme: Theme; done: boolean; updated: string | null }) {
+  const fade = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(fade, { toValue: done ? 1 : 0, duration: done ? 160 : 320, useNativeDriver: false }).start();
+  }, [done, fade]);
+  return (
+    <View style={{ justifyContent: "center" }}>
+      <Animated.View accessibilityLiveRegion="polite" aria-live="polite"
+        style={{ position: "absolute", right: 0, flexDirection: "row", alignItems: "center", gap: 4, opacity: fade,
+          transform: [{ translateY: fade.interpolate({ inputRange: [0, 1], outputRange: [3, 0] }) }] }}>
+        <Text style={{ fontSize: 12, fontWeight: "700", color: theme.colors.statusSuccess }}>✓</Text>
+        <Text numberOfLines={1} style={{ fontSize: 12, color: theme.colors.foreground }}>{done ? "확인 완료" : ""}</Text>
+      </Animated.View>
+      <Animated.Text numberOfLines={1} style={{ fontSize: 12, color: secondaryText(theme), opacity: fade.interpolate({ inputRange: [0, 1], outputRange: [1, 0] }) }}>
+        {updated ?? ""}
+      </Animated.Text>
+    </View>
+  );
+}
+
 function UsagePopover({ theme, host }: PluginPopoverProps) {
   const query = useUsage(host.id);
   const now = useNow();
   const providers = query.data?.providers ?? [];
   const updated = formatAgo(query.data?.fetchedAt, now);
-  const retry = () => { void query.refetch(); };
+  const { refresh, spinning, done } = useManualRefresh(query);
+  const retry = () => { void refresh(); };
   return (
     <View style={{ minWidth: 280, paddingHorizontal: 4, paddingVertical: 2, gap: 18 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         <Text style={{ fontSize: 15, fontWeight: "600", color: theme.colors.foreground }}>사용량</Text>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{host.label}</Text>
-        {updated && <Text style={{ fontSize: 12, color: secondaryText(theme) }}>{updated}</Text>}
-        <Pressable accessibilityRole="button" accessibilityLabel="새로고침" hitSlop={8}
-          disabled={query.isFetching} onPress={retry}
-          style={({ hovered }: { hovered?: boolean; pressed: boolean }) => ({
-            width: 26, height: 26, borderRadius: 7, alignItems: "center", justifyContent: "center",
-            backgroundColor: hovered ? theme.colors.surface2 : "transparent", opacity: query.isFetching ? 0.4 : 1,
-          })}>
-          <Text style={{ fontSize: 15, color: secondaryText(theme) }}>↻</Text>
-        </Pressable>
+        <RefreshStatus theme={theme} done={done} updated={updated} />
+        <RefreshButton theme={theme} spinning={spinning} onPress={retry} />
       </View>
       {query.isError && (
         <View style={{ flexDirection: "row", gap: 10, padding: 10, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
           <View style={{ width: 3, borderRadius: 2, backgroundColor: theme.colors.statusWarning }} />
           <View style={{ flex: 1 }}>
-            <Notice theme={theme} onRetry={retry} busy={query.isFetching}
+            <Notice theme={theme} onRetry={retry} busy={spinning}
               title={query.data ? "최신 사용량을 불러오지 못했어요." : "사용량을 불러오지 못했어요."}
               hint={query.data ? "아래는 마지막으로 받은 값이에요." : "Paseo 서버 연결을 확인하고 다시 시도해 주세요."} />
           </View>
