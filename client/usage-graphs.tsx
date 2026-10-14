@@ -7,12 +7,23 @@ type Theme = PluginSidebarItemProps["theme"];
 type UsagePayload = Awaited<ReturnType<PluginClientContext["paseo"]["providers"]["listUsage"]>>;
 type ProviderUsage = UsagePayload["providers"][number];
 type UsageWindow = ProviderUsage["windows"][number];
+type UsageQuery = ReturnType<typeof useUsage>;
+type AccountState = "loading" | "failed" | "missing" | "error" | "unavailable" | "no_windows" | "ok";
 
 const MINUTE = 60_000;
 const PROVIDERS = [
   { id: "claude", name: "Claude" },
   { id: "codex", name: "Codex" },
 ] as const;
+
+/** Short sidebar wording for every state that has no numbers to show. */
+const STATE_SHORT: Record<Exclude<AccountState, "ok" | "loading">, string> = {
+  failed: "불러오지 못함",
+  missing: "정보 없음",
+  error: "일시적 오류",
+  unavailable: "사용 불가",
+  no_windows: "표시할 구간 없음",
+};
 
 function useUsage(hostId: string) {
   const paseo = usePaseo();
@@ -34,11 +45,33 @@ function useNow() {
   return now;
 }
 
-function readProvider(provider: ProviderUsage | undefined) {
+function windowsOf(provider: ProviderUsage | undefined) {
   const windows = provider?.status === "available" ? provider.windows : [];
-  const fiveHour = windows.find((usageWindow) => usageWindow.id === "five_hour");
-  const weekly = windows.find((usageWindow) => usageWindow.id === "weekly");
-  return { fiveHour, weekly, ok: Boolean(fiveHour || weekly) };
+  return {
+    windows,
+    fiveHour: windows.find((usageWindow) => usageWindow.id === "five_hour"),
+    weekly: windows.find((usageWindow) => usageWindow.id === "weekly"),
+  };
+}
+
+function hasMainWindows(provider: ProviderUsage) {
+  const { fiveHour, weekly } = windowsOf(provider);
+  return Boolean(fiveHour || weekly);
+}
+
+/** One provider can report several accounts; the sidebar shows the first one that has numbers. */
+function accountsOf(providers: readonly ProviderUsage[], id: string) {
+  const accounts = providers.filter((provider) => provider.providerId === id);
+  const primary = accounts.find(hasMainWindows) ?? accounts.find((provider) => provider.status === "available") ?? accounts[0];
+  return { accounts, primary };
+}
+
+function stateOf(provider: ProviderUsage | undefined, query: UsageQuery): AccountState {
+  if (!query.data) return query.isError ? "failed" : "loading";
+  if (!provider) return "missing";
+  if (provider.status === "error") return "error";
+  if (provider.status === "unavailable") return "unavailable";
+  return hasMainWindows(provider) ? "ok" : "no_windows";
 }
 
 function percentOf(usageWindow?: UsageWindow) {
@@ -63,9 +96,21 @@ function channels(color: string) {
   return rgb?.length === 3 ? rgb : null;
 }
 
+function mix(from: string, to: string, amount: number) {
+  const a = channels(from);
+  const b = channels(to);
+  if (!a || !b) return from;
+  return `rgb(${a.map((c, k) => Math.round(c + (b[k] - c) * amount)).join(", ")})`;
+}
+
 function isDark(theme: Theme) {
   const rgb = channels(theme.colors.surface0) ?? [0, 0, 0];
   return rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114 < 128;
+}
+
+/** The host's muted ink nudged toward the foreground so small labels clear 4.5:1 in both themes. */
+function secondaryText(theme: Theme) {
+  return mix(theme.colors.foregroundMuted, theme.colors.foreground, 0.3);
 }
 
 /** Blue → green → yellow → red as usage climbs, blended between stops. */
@@ -75,9 +120,7 @@ function usageColor(theme: Theme, percent: number | null) {
   const i = Math.max(0, STOPS.findIndex((stop, index) => value <= (STOPS[index + 1] ?? Infinity)));
   if (i >= STOPS.length - 1) return colors[colors.length - 1];
   const t = Math.min(1, Math.max(0, (value - STOPS[i]) / (STOPS[i + 1] - STOPS[i])));
-  const from = channels(colors[i])!;
-  const to = channels(colors[i + 1])!;
-  return `rgb(${from.map((c, k) => Math.round(c + (to[k] - c) * t)).join(", ")})`;
+  return mix(colors[i], colors[i + 1], t);
 }
 
 function Bar({ percent, theme, height }: { percent: number | null; theme: Theme; height: number }) {
@@ -104,11 +147,20 @@ function formatReset(resetsAt: string | null | undefined, now: number) {
   return `${mins}분 후 초기화`;
 }
 
+function formatAgo(at: string | null | undefined, now: number) {
+  const time = at ? Date.parse(at) : NaN;
+  if (!Number.isFinite(time)) return null;
+  const minutes = Math.floor((now - time) / MINUTE);
+  if (minutes < 1) return "방금 갱신";
+  if (minutes < 60) return `${minutes}분 전 갱신`;
+  return `${Math.floor(minutes / 60)}시간 전 갱신`;
+}
+
 function Cell({ label, usageWindow, theme }: { label: string; usageWindow?: UsageWindow; theme: Theme }) {
   const percent = percentOf(usageWindow);
   return (
     <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
-      <Text style={{ fontSize: 11, color: theme.colors.foregroundMuted, opacity: 0.8 }}>{label}</Text>
+      <Text style={{ fontSize: 11, color: secondaryText(theme) }}>{label}</Text>
       <Bar percent={percent} theme={theme} height={4} />
       <Text style={{ minWidth: 28, textAlign: "right", fontSize: 12, fontWeight: "500", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>
         {formatPercent(percent)}
@@ -117,18 +169,18 @@ function Cell({ label, usageWindow, theme }: { label: string; usageWindow?: Usag
   );
 }
 
-function Row({ name, provider, theme, loading }: { name: string; provider?: ProviderUsage; theme: Theme; loading: boolean }) {
-  const { fiveHour, weekly, ok } = readProvider(provider);
+function Row({ name, provider, state, theme }: { name: string; provider?: ProviderUsage; state: AccountState; theme: Theme }) {
+  const { fiveHour, weekly } = windowsOf(provider);
   return (
     <View style={{ flexDirection: "row", alignItems: "center", gap: 8, height: 22 }}>
       <Text numberOfLines={1} style={{ width: 54, fontSize: 12, fontWeight: "600", color: theme.colors.foreground }}>{name}</Text>
-      {ok || loading ? (
-        <>
+      {state === "ok" || state === "loading" ? (
+        <View style={{ flex: 1, flexDirection: "row", gap: 8 }}>
           <Cell label="5h" usageWindow={fiveHour} theme={theme} />
           <Cell label="1w" usageWindow={weekly} theme={theme} />
-        </>
+        </View>
       ) : (
-        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: theme.colors.foregroundMuted }}>연결 필요</Text>
+        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{STATE_SHORT[state]}</Text>
       )}
     </View>
   );
@@ -137,15 +189,18 @@ function Row({ name, provider, theme, loading }: { name: string; provider?: Prov
 function DetailRow({ label, usageWindow, theme, now }: { label: string; usageWindow?: UsageWindow; theme: Theme; now: number }) {
   const percent = percentOf(usageWindow);
   const reset = formatReset(usageWindow?.resetsAt, now);
+  const rounded = percent === null ? undefined : Math.round(percent);
   return (
     <View style={{ gap: 6 }}>
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
         <Text style={{ fontSize: 13, color: theme.colors.foreground }}>{label}</Text>
-        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: theme.colors.foregroundMuted }}>{reset ?? ""}</Text>
+        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{reset ?? ""}</Text>
         <Text style={{ fontSize: 13, fontWeight: "600", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>{formatPercent(percent)}</Text>
       </View>
-      <View accessibilityRole="progressbar" accessibilityLabel={`${label} ${formatPercent(percent)}`}
-        accessibilityValue={percent === null ? { text: "조회되지 않음" } : { min: 0, max: 100, now: Math.round(percent) }}
+      <View accessibilityRole="progressbar" accessibilityLabel={label}
+        accessibilityValue={rounded === undefined ? { text: "조회되지 않음" } : { min: 0, max: 100, now: rounded }}
+        aria-valuemin={0} aria-valuemax={100} aria-valuenow={rounded}
+        aria-valuetext={rounded === undefined ? "조회되지 않음" : `${rounded}%`}
         style={{ flexDirection: "row" }}>
         <Bar percent={percent} theme={theme} height={6} />
       </View>
@@ -153,42 +208,99 @@ function DetailRow({ label, usageWindow, theme, now }: { label: string; usageWin
   );
 }
 
+function Notice({ title, hint, theme, onRetry, busy }: { title: string; hint?: string; theme: Theme; onRetry?(): void; busy?: boolean }) {
+  return (
+    <View style={{ gap: 4 }}>
+      <Text style={{ fontSize: 13, color: theme.colors.foreground }}>{title}</Text>
+      {hint && <Text style={{ fontSize: 12, color: secondaryText(theme) }}>{hint}</Text>}
+      {onRetry && (
+        <Pressable accessibilityRole="button" disabled={busy} onPress={onRetry}
+          style={({ hovered }: { hovered?: boolean; pressed: boolean }) => ({
+            alignSelf: "flex-start", marginTop: 4, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6,
+            borderWidth: 1, borderColor: theme.colors.border,
+            backgroundColor: hovered ? theme.colors.surface2 : "transparent", opacity: busy ? 0.5 : 1,
+          })}>
+          <Text style={{ fontSize: 12, fontWeight: "500", color: theme.colors.foreground }}>{busy ? "다시 불러오는 중…" : "다시 시도"}</Text>
+        </Pressable>
+      )}
+    </View>
+  );
+}
+
+function AccountDetail({ name, provider, state, theme, now }: { name: string; provider?: ProviderUsage; state: AccountState; theme: Theme; now: number }) {
+  const { windows, fiveHour, weekly } = windowsOf(provider);
+  if (state === "ok") {
+    return (
+      <>
+        {fiveHour && <DetailRow label="5시간" usageWindow={fiveHour} theme={theme} now={now} />}
+        {weekly && <DetailRow label="주간" usageWindow={weekly} theme={theme} now={now} />}
+      </>
+    );
+  }
+  if (state === "no_windows") {
+    return windows.length > 0
+      ? <>{windows.map((usageWindow) => <DetailRow key={usageWindow.id} label={usageWindow.label} usageWindow={usageWindow} theme={theme} now={now} />)}</>
+      : <Notice title="조회는 됐지만 표시할 사용량 구간이 없어요." hint="이 요금제는 5시간·주간 한도를 제공하지 않을 수 있어요." theme={theme} />;
+  }
+  if (state === "error") {
+    return <Notice title="사용량 서버에서 오류가 났어요." hint={`${provider?.error ? `${provider.error} · ` : ""}잠시 후 다시 시도해 주세요.`} theme={theme} />;
+  }
+  if (state === "unavailable") {
+    return <Notice title={provider?.error ?? "지금은 사용량을 볼 수 없어요."} hint={`${name} 로그인 상태나 요금제를 확인해 주세요.`} theme={theme} />;
+  }
+  if (state === "missing") {
+    return <Notice title={`이 호스트에서 ${name} 사용량 정보를 받지 못했어요.`} hint={`${name}가 이 호스트에 설정돼 있는지 확인해 주세요.`} theme={theme} />;
+  }
+  return <Text style={{ fontSize: 13, color: secondaryText(theme) }}>불러오는 중…</Text>;
+}
+
 function UsagePopover({ theme, host }: PluginPopoverProps) {
   const query = useUsage(host.id);
   const now = useNow();
   const providers = query.data?.providers ?? [];
+  const updated = formatAgo(query.data?.fetchedAt, now);
+  const retry = () => { void query.refetch(); };
   return (
     <View style={{ minWidth: 280, paddingHorizontal: 4, paddingVertical: 2, gap: 18 }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
         <Text style={{ fontSize: 15, fontWeight: "600", color: theme.colors.foreground }}>사용량</Text>
-        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: theme.colors.foregroundMuted }}>{host.label}</Text>
+        <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{host.label}</Text>
+        {updated && <Text style={{ fontSize: 12, color: secondaryText(theme) }}>{updated}</Text>}
         <Pressable accessibilityRole="button" accessibilityLabel="새로고침" hitSlop={8}
-          disabled={query.isFetching} onPress={() => { void query.refetch(); }}
+          disabled={query.isFetching} onPress={retry}
           style={({ hovered }: { hovered?: boolean; pressed: boolean }) => ({
             width: 26, height: 26, borderRadius: 7, alignItems: "center", justifyContent: "center",
             backgroundColor: hovered ? theme.colors.surface2 : "transparent", opacity: query.isFetching ? 0.4 : 1,
           })}>
-          <Text style={{ fontSize: 15, color: theme.colors.foregroundMuted }}>↻</Text>
+          <Text style={{ fontSize: 15, color: secondaryText(theme) }}>↻</Text>
         </Pressable>
       </View>
-      {PROVIDERS.map(({ id, name }) => {
-        const provider = providers.find((item) => item.providerId === id);
-        const { fiveHour, weekly, ok } = readProvider(provider);
-        return (
-          <View key={id} style={{ gap: 12 }}>
-            <Text style={{ fontSize: 12, fontWeight: "600", color: theme.colors.foregroundMuted }}>{name}</Text>
-            {ok ? (
-              <>
-                <DetailRow label="5시간" usageWindow={fiveHour} theme={theme} now={now} />
-                <DetailRow label="주간" usageWindow={weekly} theme={theme} now={now} />
-              </>
-            ) : (
-              <Text style={{ fontSize: 13, color: theme.colors.foregroundMuted }}>
-                {query.isPending ? "불러오는 중…" : provider?.error ?? "로그인 또는 연결을 확인해 주세요."}
-              </Text>
-            )}
+      {query.isError && (
+        <View style={{ flexDirection: "row", gap: 10, padding: 10, borderRadius: 8, borderWidth: 1, borderColor: theme.colors.border, backgroundColor: theme.colors.surface1 }}>
+          <View style={{ width: 3, borderRadius: 2, backgroundColor: theme.colors.statusWarning }} />
+          <View style={{ flex: 1 }}>
+            <Notice theme={theme} onRetry={retry} busy={query.isFetching}
+              title={query.data ? "최신 사용량을 불러오지 못했어요." : "사용량을 불러오지 못했어요."}
+              hint={query.data ? "아래는 마지막으로 받은 값이에요." : "Paseo 서버 연결을 확인하고 다시 시도해 주세요."} />
           </View>
-        );
+        </View>
+      )}
+      {(query.data || query.isPending) && PROVIDERS.map(({ id, name }) => {
+        const { accounts, primary } = accountsOf(providers, id);
+        const list = accounts.length > 0 ? accounts : [undefined];
+        return list.map((provider, index) => {
+          const account = list.length > 1 ? provider?.sourceLabel ?? provider?.planLabel ?? `계정 ${index + 1}` : null;
+          return (
+            <View key={`${id}-${index}`} style={{ gap: 12 }}>
+              <View style={{ flexDirection: "row", alignItems: "baseline", gap: 6 }}>
+                <Text style={{ fontSize: 12, fontWeight: "600", color: secondaryText(theme) }}>{name}</Text>
+                {account && <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{account}</Text>}
+                {list.length > 1 && provider === primary && <Text style={{ fontSize: 11, color: secondaryText(theme) }}>사이드바 표시</Text>}
+              </View>
+              <AccountDetail name={name} provider={provider} state={stateOf(provider, query)} theme={theme} now={now} />
+            </View>
+          );
+        });
       })}
     </View>
   );
@@ -197,21 +309,33 @@ function UsagePopover({ theme, host }: PluginPopoverProps) {
 export function UsageGraphs({ theme, host, layout, openPopover }: PluginSidebarItemProps) {
   const query = useUsage(host.id);
   const providers = query.data?.providers ?? [];
-  const summary = PROVIDERS.map(({ id, name }) => {
-    const { fiveHour, weekly } = readProvider(providers.find((provider) => provider.providerId === id));
+  const stale = query.isError && Boolean(query.data);
+  const rows = PROVIDERS.map(({ id, name }) => {
+    const { primary } = accountsOf(providers, id);
+    return { id, name, provider: primary, state: stateOf(primary, query) };
+  });
+  const summary = rows.map(({ name, provider, state }) => {
+    if (state !== "ok") return `${name} ${state === "loading" ? "불러오는 중" : STATE_SHORT[state]}`;
+    const { fiveHour, weekly } = windowsOf(provider);
     return `${name} 5시간 ${formatPercent(percentOf(fiveHour))}, 주간 ${formatPercent(percentOf(weekly))}`;
   }).join(". ");
   return (
     <View style={{ width: "100%", paddingHorizontal: layout.compact ? 4 : 6, paddingVertical: 4 }}>
-      <Pressable onPress={() => openPopover(UsagePopover)} accessibilityRole="button" accessibilityLabel={`사용량: ${summary}`}
+      <Pressable onPress={() => openPopover(UsagePopover)} accessibilityRole="button"
+        accessibilityLabel={`사용량: ${summary}${stale ? ". 갱신 실패, 이전 값" : ""}`}
         style={({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) => ({
           paddingVertical: 5, paddingHorizontal: 8, borderRadius: 8, gap: 2,
           backgroundColor: pressed ? theme.colors.surface2 : hovered ? theme.colors.surface1 : "transparent",
         })}>
-        {PROVIDERS.map(({ id, name }) => (
-          <Row key={id} name={name} theme={theme} loading={query.isPending}
-            provider={providers.find((provider) => provider.providerId === id)} />
+        {rows.map(({ id, name, provider, state }) => (
+          <Row key={id} name={name} provider={provider} state={state} theme={theme} />
         ))}
+        {stale && (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 6, height: 18 }}>
+            <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: theme.colors.statusWarning }} />
+            <Text numberOfLines={1} style={{ flex: 1, fontSize: 11, color: secondaryText(theme) }}>갱신 실패 · 이전 값 표시 중</Text>
+          </View>
+        )}
       </Pressable>
     </View>
   );
