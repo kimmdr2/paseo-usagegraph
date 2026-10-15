@@ -76,9 +76,16 @@ function stateOf(provider: ProviderUsage | undefined, query: UsageQuery): Accoun
   return hasMainWindows(provider) ? "ok" : "no_windows";
 }
 
-function percentOf(usageWindow?: UsageWindow) {
-  const value = usageWindow?.usedPct;
+function clampPct(value: number | null | undefined) {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : null;
+}
+
+/** Share of the limit still left; derived from usedPct when the provider omits remainingPct. */
+function remainingOf(usageWindow?: UsageWindow) {
+  const remaining = clampPct(usageWindow?.remainingPct);
+  if (remaining !== null) return remaining;
+  const used = clampPct(usageWindow?.usedPct);
+  return used === null ? null : 100 - used;
 }
 
 function formatPercent(percent: number | null) {
@@ -115,7 +122,7 @@ function secondaryText(theme: Theme) {
   return mix(theme.colors.foregroundMuted, theme.colors.foreground, 0.3);
 }
 
-/** Blue → green → yellow → red as usage climbs, blended between stops. */
+/** Blue → green → yellow → red as usage climbs (i.e. as what is left shrinks), blended between stops. */
 function usageColor(theme: Theme, percent: number | null) {
   const colors = SCALE[isDark(theme) ? "dark" : "light"];
   const value = percent ?? 0;
@@ -125,12 +132,13 @@ function usageColor(theme: Theme, percent: number | null) {
   return mix(colors[i], colors[i + 1], t);
 }
 
-function Bar({ percent, theme, height }: { percent: number | null; theme: Theme; height: number }) {
+/** Fills with what is left, like a battery. */
+function Bar({ remaining, theme, height }: { remaining: number | null; theme: Theme; height: number }) {
   return (
     <View style={{ flex: 1, height, borderRadius: height / 2, overflow: "hidden" }}>
       <View style={{ position: "absolute", top: 0, right: 0, bottom: 0, left: 0, backgroundColor: theme.colors.foreground, opacity: 0.1 }} />
-      {percent !== null && percent > 0 && (
-        <View style={{ width: `${percent}%`, minWidth: height, height: "100%", borderRadius: height / 2, backgroundColor: usageColor(theme, percent) }} />
+      {remaining !== null && remaining > 0 && (
+        <View style={{ width: `${remaining}%`, minWidth: height, height: "100%", borderRadius: height / 2, backgroundColor: usageColor(theme, 100 - remaining) }} />
       )}
     </View>
   );
@@ -159,13 +167,13 @@ function formatAgo(at: string | null | undefined, now: number) {
 }
 
 function Cell({ label, usageWindow, theme }: { label: string; usageWindow?: UsageWindow; theme: Theme }) {
-  const percent = percentOf(usageWindow);
+  const remaining = remainingOf(usageWindow);
   return (
     <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
       <Text style={{ fontSize: 11, color: secondaryText(theme) }}>{label}</Text>
-      <Bar percent={percent} theme={theme} height={4} />
-      <Text style={{ minWidth: 28, textAlign: "right", fontSize: 12, fontWeight: "500", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>
-        {formatPercent(percent)}
+      <Bar remaining={remaining} theme={theme} height={4} />
+      <Text numberOfLines={1} style={{ width: 40, textAlign: "right", fontSize: 12, fontWeight: "500", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>
+        {formatPercent(remaining)}
       </Text>
     </View>
   );
@@ -189,22 +197,22 @@ function Row({ name, provider, state, theme }: { name: string; provider?: Provid
 }
 
 function DetailRow({ label, usageWindow, theme, now }: { label: string; usageWindow?: UsageWindow; theme: Theme; now: number }) {
-  const percent = percentOf(usageWindow);
+  const remaining = remainingOf(usageWindow);
   const reset = formatReset(usageWindow?.resetsAt, now);
-  const rounded = percent === null ? undefined : Math.round(percent);
+  const rounded = remaining === null ? undefined : Math.round(remaining);
   return (
     <View style={{ gap: 6 }}>
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
         <Text style={{ fontSize: 13, color: theme.colors.foreground }}>{label}</Text>
         <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: secondaryText(theme) }}>{reset ?? ""}</Text>
-        <Text style={{ fontSize: 13, fontWeight: "600", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>{formatPercent(percent)}</Text>
+        <Text style={{ fontSize: 13, fontWeight: "600", color: theme.colors.foreground, fontVariant: ["tabular-nums"] }}>{formatPercent(remaining)}</Text>
       </View>
-      <View accessibilityRole="progressbar" accessibilityLabel={label}
+      <View accessibilityRole="progressbar" accessibilityLabel={`${label} 남은 양`}
         accessibilityValue={rounded === undefined ? { text: "조회되지 않음" } : { min: 0, max: 100, now: rounded }}
         aria-valuemin={0} aria-valuemax={100} aria-valuenow={rounded}
-        aria-valuetext={rounded === undefined ? "조회되지 않음" : `${rounded}%`}
+        aria-valuetext={rounded === undefined ? "조회되지 않음" : `${rounded}% 남음`}
         style={{ flexDirection: "row" }}>
-        <Bar percent={percent} theme={theme} height={6} />
+        <Bar remaining={remaining} theme={theme} height={6} />
       </View>
     </View>
   );
@@ -383,7 +391,7 @@ export function UsageGraphs({ theme, host, layout, openPopover }: PluginSidebarI
   const summary = rows.map(({ name, provider, state }) => {
     if (state !== "ok") return `${name} ${state === "loading" ? "불러오는 중" : STATE_SHORT[state]}`;
     const { fiveHour, weekly } = windowsOf(provider);
-    return `${name} 5시간 ${formatPercent(percentOf(fiveHour))}, 주간 ${formatPercent(percentOf(weekly))}`;
+    return `${name} 5시간 ${formatPercent(remainingOf(fiveHour))} 남음, 주간 ${formatPercent(remainingOf(weekly))} 남음`;
   }).join(". ");
   return (
     <View style={{ width: "100%", paddingHorizontal: layout.compact ? 4 : 6, paddingVertical: 4 }}>
